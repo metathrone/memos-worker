@@ -1,6 +1,11 @@
 name = "memos-worker"
 compatibility_date = "2025-08-19"
 main = "src/index.js"
+
+routes = [
+  { pattern = "memos.rushia.eu.org", custom_domain = true }
+]
+
 [assets]
 directory = "./src/public"
 run_worker_first = [
@@ -9,15 +14,13 @@ run_worker_first = [
 
 [[d1_databases]]
 binding = "DB"
-database_id = "YOUR_D1_DATABASE_ID"
-database_name = "YOUR_D1_DATABASE_NAME"
+database_id = "ec18ab97-d7f5-4960-8e9f-1ef3e7cc0d78"
+database_name = "notes-db"
 
 [[kv_namespaces]]
 binding = "NOTES_KV"
-id = "YOUR_KV_NAMESPACE_ID"
-preview_id = ""
+id = "ae897c2fc66844b08c6cd9177c708a19"
 
 [[r2_buckets]]
 binding = "NOTES_R2_BUCKET"
-bucket_name = "YOUR_R2_BUCKET_NAME"
-preview_bucket_name = "notes-files-preview"
+bucket_name = "notes-r2-bucket"

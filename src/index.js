@@ -13,6 +13,30 @@ export default {
 async function handleApiRequest(request, env) {
 	const { pathname } = new URL(request.url);
 
+	// --- Memos 官方 /api/v1/memos 兼容接口 (供博客动态实时拉取，支持 CORS) ---
+	if (pathname === '/api/v1/memos') {
+		if (request.method === 'OPTIONS') {
+			return new Response(null, {
+				status: 204,
+				headers: {
+					'Access-Control-Allow-Origin': '*',
+					'Access-Control-Allow-Methods': 'GET, OPTIONS',
+					'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
+					'Access-Control-Max-Age': '86400',
+				},
+			});
+		}
+		if (request.method === 'GET') {
+			return handleMemosV1List(request, env);
+		}
+	}
+
+	// 允许公开访问独立上传的图片 (UUID 不可猜测，供博客动态页渲染配图)
+	const publicImageMatch = pathname.match(/^\/api\/images\/([a-zA-Z0-9-]+)$/);
+	if (publicImageMatch && request.method === 'GET') {
+		return handleServeStandaloneImage(publicImageMatch[1], env);
+	}
+
 	// --- Memos 分享公开路由 ---
 	// 匹配分享页面 /share/some-uuid
 	const sharePageMatch = pathname.match(/^\/share\/([a-zA-Z0-9-]+)$/);
@@ -36,7 +60,7 @@ async function handleApiRequest(request, env) {
 		const publicId = publicRawNoteMatch[1];
 		return handlePublicRawNoteRequest(publicId, env);
 	}
-	// --- Memos 分享公开路由 ---
+	// --- Memos 分享公开路由结束 ---
 
 	// 公开文件访问路由 (必须在身份验证之前)
 	const publicFileMatch = pathname.match(/^\/api\/public\/file\/([a-zA-Z0-9-]+)$/);
@@ -2024,4 +2048,84 @@ async function handleMergeNotes(request, env) {
 function jsonResponse(data, status = 200, headers = new Headers()) {
 	headers.set('Content-Type', 'application/json');
 	return new Response(JSON.stringify(data, null, 2), { status, headers });
+}
+
+
+/**
+ * 官方 Memos v1 API 兼容接口：GET /api/v1/memos
+ * 供博客动态页 (memos-adapter.ts) 实时拉取公开、未归档的动态
+ */
+async function handleMemosV1List(request, env) {
+	const corsHeaders = {
+		'Content-Type': 'application/json; charset=utf-8',
+		'Access-Control-Allow-Origin': '*',
+		'Access-Control-Allow-Methods': 'GET, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
+		'Cache-Control': 'public, max-age=30',
+	};
+	try {
+		const url = new URL(request.url);
+		const pageSize = Math.min(Math.max(parseInt(url.searchParams.get('pageSize') || '50', 10) || 50, 1), 200);
+		const offset = Math.max(parseInt(url.searchParams.get('pageToken') || '0', 10) || 0, 0);
+		const creator = `users/${env.USERNAME || 'rushia'}`;
+
+		const { results } = await env.DB.prepare(
+			'SELECT id, content, files, created_at, updated_at, is_pinned, pics FROM notes WHERE is_archived = 0 ORDER BY is_pinned DESC, created_at DESC LIMIT ? OFFSET ?'
+		)
+			.bind(pageSize + 1, offset)
+			.all();
+
+		const hasMore = results.length > pageSize;
+		const rows = hasMore ? results.slice(0, pageSize) : results;
+
+		const toIso = (ts) => {
+			const n = Number(ts) || Date.now();
+			return new Date(n < 1e12 ? n * 1000 : n).toISOString();
+		};
+
+		const memos = rows.map((row) => {
+			const attachments = [];
+			if (row.pics) {
+				try {
+					const pics = JSON.parse(row.pics);
+					if (Array.isArray(pics)) {
+						pics.forEach((picUrl, idx) => {
+							if (typeof picUrl === 'string' && picUrl.trim()) {
+								attachments.push({
+									name: `attachments/pic-${row.id}-${idx}`,
+									filename: `image-${idx}.jpg`,
+									type: 'image/jpeg',
+									externalLink: picUrl.trim(),
+								});
+							}
+						});
+					}
+				} catch (_) {}
+			}
+			return {
+				name: `memos/${row.id}`,
+				state: 'NORMAL',
+				creator,
+				createTime: toIso(row.created_at),
+				updateTime: toIso(row.updated_at),
+				content: row.content || '',
+				visibility: 'PUBLIC',
+				pinned: Boolean(row.is_pinned),
+				attachments,
+			};
+		});
+
+		return new Response(
+			JSON.stringify({
+				memos,
+				nextPageToken: hasMore ? String(offset + pageSize) : '',
+			}),
+			{ status: 200, headers: corsHeaders }
+		);
+	} catch (e) {
+		return new Response(
+			JSON.stringify({ error: 'Failed to load memos', message: e.message }),
+			{ status: 500, headers: corsHeaders }
+		);
+	}
 }
