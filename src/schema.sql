@@ -13,7 +13,9 @@ CREATE TABLE notes (
   is_favorited INTEGER DEFAULT 0 NOT NULL,
   is_archived INTEGER DEFAULT 0 NOT NULL,
   pics TEXT,
-  videos TEXT DEFAULT '[]'
+  videos TEXT DEFAULT '[]',
+  visibility TEXT NOT NULL DEFAULT 'PUBLIC',
+  location TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE note_tags (

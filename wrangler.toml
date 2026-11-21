@@ -9,7 +9,9 @@ routes = [
 [assets]
 directory = "./src/public"
 run_worker_first = [
-	"/api/*"
+	"/api/*",
+	"/rss.xml",
+	"/explore/rss.xml"
 ]
 
 [[d1_databases]]

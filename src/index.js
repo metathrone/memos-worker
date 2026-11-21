@@ -13,21 +13,38 @@ export default {
 async function handleApiRequest(request, env) {
 	const { pathname } = new URL(request.url);
 
-	// --- Memos 官方 /api/v1/memos 兼容接口 (供博客动态实时拉取，支持 CORS) ---
-	if (pathname === '/api/v1/memos') {
+	// --- 公开动态 RSS 订阅 ---
+	if ((pathname === '/rss.xml' || pathname === '/explore/rss.xml') && request.method === 'GET') {
+		return handleRssFeed(request, env);
+	}
+
+	// --- 官方 Memos REST API 兼容层 (/api/v1/* & /api/memos，支持 CORS 与 Bearer Token) ---
+	if (
+		pathname === '/api/v1/memos' ||
+		pathname === '/api/memos' ||
+		/^\/api(?:\/v1)?\/memos\/\d+$/.test(pathname) ||
+		pathname === '/api/v1/auth/status' ||
+		pathname === '/api/auth/status' ||
+		pathname === '/api/v1/users/me' ||
+		/^\/api\/v1\/users\/[^/]+$/.test(pathname)
+	) {
 		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				status: 204,
-				headers: {
-					'Access-Control-Allow-Origin': '*',
-					'Access-Control-Allow-Methods': 'GET, OPTIONS',
-					'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
-					'Access-Control-Max-Age': '86400',
-				},
-			});
+			return new Response(null, { status: 204, headers: getMemosCorsHeaders() });
 		}
-		if (request.method === 'GET') {
-			return handleMemosV1List(request, env);
+		if (
+			pathname === '/api/v1/auth/status' ||
+			pathname === '/api/auth/status' ||
+			pathname === '/api/v1/users/me' ||
+			/^\/api\/v1\/users\/[^/]+$/.test(pathname)
+		) {
+			return handleMemosAuthStatus(request, env);
+		}
+		if (pathname === '/api/v1/memos' || pathname === '/api/memos') {
+			return handleMemosCollection(request, env);
+		}
+		const memoItemMatch = pathname.match(/^\/api(?:\/v1)?\/memos\/(\d+)$/);
+		if (memoItemMatch) {
+			return handleMemosItem(request, env, parseInt(memoItemMatch[1], 10));
 		}
 	}
 
@@ -2051,81 +2068,357 @@ function jsonResponse(data, status = 200, headers = new Headers()) {
 }
 
 
-/**
- * 官方 Memos v1 API 兼容接口：GET /api/v1/memos
- * 供博客动态页 (memos-adapter.ts) 实时拉取公开、未归档的动态
- */
-async function handleMemosV1List(request, env) {
-	const corsHeaders = {
+function getMemosCorsHeaders(extra = {}) {
+	return {
 		'Content-Type': 'application/json; charset=utf-8',
 		'Access-Control-Allow-Origin': '*',
-		'Access-Control-Allow-Methods': 'GET, OPTIONS',
+		'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, DELETE, OPTIONS',
 		'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
-		'Cache-Control': 'public, max-age=30',
+		'Access-Control-Max-Age': '86400',
+		...extra,
 	};
-	try {
-		const url = new URL(request.url);
-		const pageSize = Math.min(Math.max(parseInt(url.searchParams.get('pageSize') || '50', 10) || 50, 1), 200);
-		const offset = Math.max(parseInt(url.searchParams.get('pageToken') || '0', 10) || 0, 0);
-		const creator = `users/${env.USERNAME || 'rushia'}`;
+}
 
-		const { results } = await env.DB.prepare(
-			'SELECT id, content, files, created_at, updated_at, is_pinned, pics FROM notes WHERE is_archived = 0 ORDER BY is_pinned DESC, created_at DESC LIMIT ? OFFSET ?'
-		)
-			.bind(pageSize + 1, offset)
-			.all();
+async function isMemosApiAuthorized(request, env) {
+	const authHeader = request.headers.get('Authorization') || '';
+	const match = authHeader.match(/^Bearer\s+(.+)$/i);
+	if (match && env.API_TOKEN && match[1].trim() === env.API_TOKEN) {
+		return true;
+	}
+	return Boolean(await isSessionAuthenticated(request, env));
+}
 
-		const hasMore = results.length > pageSize;
-		const rows = hasMore ? results.slice(0, pageSize) : results;
+function extractLocationAndCleanContent(rawContent, dbLocation) {
+	let content = String(rawContent || '');
+	let location = String(dbLocation || '').trim();
+	// 支持在网页端通过 @地点:上海 或 @location:Tokyo 标记位置
+	const locMatch = content.match(/(?:^|\s)@(?:地点|location)[:：]\s*([^\s\n]+)/i);
+	if (locMatch) {
+		if (!location) location = locMatch[1].trim();
+		content = content.replace(locMatch[0], '').trim();
+	}
+	return { content, location };
+}
 
-		const toIso = (ts) => {
-			const n = Number(ts) || Date.now();
-			return new Date(n < 1e12 ? n * 1000 : n).toISOString();
-		};
+function isRowPrivate(row) {
+	if (String(row.visibility || 'PUBLIC').toUpperCase() === 'PRIVATE') return true;
+	if (/(?:^|\s)#private(?:\s|$)/i.test(String(row.content || ''))) return true;
+	return false;
+}
 
-		const memos = rows.map((row) => {
-			const attachments = [];
-			if (row.pics) {
-				try {
-					const pics = JSON.parse(row.pics);
-					if (Array.isArray(pics)) {
-						pics.forEach((picUrl, idx) => {
-							if (typeof picUrl === 'string' && picUrl.trim()) {
-								attachments.push({
-									name: `attachments/pic-${row.id}-${idx}`,
-									filename: `image-${idx}.jpg`,
-									type: 'image/jpeg',
-									externalLink: picUrl.trim(),
-								});
-							}
+function formatMemoRow(row, creator) {
+	const toIso = (ts) => {
+		const n = Number(ts) || Date.now();
+		return new Date(n < 1e12 ? n * 1000 : n).toISOString();
+	};
+	const attachments = [];
+	if (row.pics) {
+		try {
+			const pics = JSON.parse(row.pics);
+			if (Array.isArray(pics)) {
+				pics.forEach((picUrl, idx) => {
+					if (typeof picUrl === 'string' && picUrl.trim()) {
+						attachments.push({
+							name: `attachments/pic-${row.id}-${idx}`,
+							filename: `image-${idx}.jpg`,
+							type: 'image/jpeg',
+							externalLink: picUrl.trim(),
 						});
 					}
-				} catch (_) {}
+				});
 			}
-			return {
-				name: `memos/${row.id}`,
-				state: 'NORMAL',
-				creator,
-				createTime: toIso(row.created_at),
-				updateTime: toIso(row.updated_at),
-				content: row.content || '',
-				visibility: 'PUBLIC',
-				pinned: Boolean(row.is_pinned),
-				attachments,
-			};
-		});
-
-		return new Response(
-			JSON.stringify({
-				memos,
-				nextPageToken: hasMore ? String(offset + pageSize) : '',
-			}),
-			{ status: 200, headers: corsHeaders }
-		);
-	} catch (e) {
-		return new Response(
-			JSON.stringify({ error: 'Failed to load memos', message: e.message }),
-			{ status: 500, headers: corsHeaders }
-		);
+		} catch (_) {}
 	}
+	const { content, location } = extractLocationAndCleanContent(row.content, row.location);
+	const visibility = isRowPrivate(row) ? 'PRIVATE' : 'PUBLIC';
+	const memo = {
+		name: `memos/${row.id}`,
+		uid: String(row.id),
+		state: row.is_archived ? 'ARCHIVED' : 'NORMAL',
+		creator,
+		createTime: toIso(row.created_at),
+		updateTime: toIso(row.updated_at),
+		content,
+		visibility,
+		pinned: Boolean(row.is_pinned),
+		attachments,
+	};
+	if (location) {
+		memo.location = { placeholder: location };
+	}
+	return memo;
+}
+
+async function handleMemosAuthStatus(request, env) {
+	const authed = await isMemosApiAuthorized(request, env);
+	if (!authed) {
+		return new Response(JSON.stringify({ code: 16, message: 'Unauthorized' }), {
+			status: 401,
+			headers: getMemosCorsHeaders(),
+		});
+	}
+	const username = env.USERNAME || 'rushia';
+	return new Response(
+		JSON.stringify({
+			name: `users/${username}`,
+			id: 1,
+			role: 'HOST',
+			username,
+			email: '',
+			nickname: username,
+			avatarUrl: '',
+			description: '',
+			state: 'NORMAL',
+		}),
+		{ status: 200, headers: getMemosCorsHeaders() }
+	);
+}
+
+/**
+ * 官方 Memos REST API 集合路由：GET/POST /api/v1/memos & /api/memos
+ */
+async function handleMemosCollection(request, env) {
+	const creator = `users/${env.USERNAME || 'rushia'}`;
+
+	if (request.method === 'GET') {
+		try {
+			const authed = await isMemosApiAuthorized(request, env);
+			const url = new URL(request.url);
+			const pageSize = Math.min(Math.max(parseInt(url.searchParams.get('pageSize') || '50', 10) || 50, 1), 200);
+			const offset = Math.max(parseInt(url.searchParams.get('pageToken') || '0', 10) || 0, 0);
+			const stateFilter = (url.searchParams.get('state') || 'NORMAL').toUpperCase();
+			const archivedFlag = stateFilter === 'ARCHIVED' ? 1 : 0;
+
+			const whereClause = authed
+				? 'is_archived = ?'
+				: "is_archived = ? AND UPPER(COALESCE(visibility, 'PUBLIC')) = 'PUBLIC' AND content NOT LIKE '%#private%'";
+
+			const { results } = await env.DB.prepare(
+				`SELECT id, content, files, created_at, updated_at, is_pinned, is_archived, pics, visibility, location FROM notes WHERE ${whereClause} ORDER BY is_pinned DESC, created_at DESC LIMIT ? OFFSET ?`
+			)
+				.bind(archivedFlag, pageSize + 1, offset)
+				.all();
+
+			const hasMore = results.length > pageSize;
+			const rows = hasMore ? results.slice(0, pageSize) : results;
+			const memos = rows
+				.filter((r) => authed || !isRowPrivate(r))
+				.map((row) => formatMemoRow(row, creator));
+
+			return new Response(
+				JSON.stringify({
+					memos,
+					nextPageToken: hasMore ? String(offset + pageSize) : '',
+				}),
+				{
+					status: 200,
+					headers: getMemosCorsHeaders({
+						'Cache-Control': authed ? 'no-store' : 'public, max-age=30',
+					}),
+				}
+			);
+		} catch (e) {
+			return new Response(JSON.stringify({ error: 'Failed to load memos', message: e.message }), {
+				status: 500,
+				headers: getMemosCorsHeaders(),
+			});
+		}
+	}
+
+	if (request.method === 'POST') {
+		if (!(await isMemosApiAuthorized(request, env))) {
+			return new Response(JSON.stringify({ code: 16, message: 'Unauthorized' }), {
+				status: 401,
+				headers: getMemosCorsHeaders(),
+			});
+		}
+		try {
+			const body = await request.json();
+			const content = String(body.content || '').trim();
+			if (!content) {
+				return new Response(JSON.stringify({ error: 'content is required' }), {
+					status: 400,
+					headers: getMemosCorsHeaders(),
+				});
+			}
+			const visibility = String(body.visibility || 'PUBLIC').toUpperCase() === 'PRIVATE' ? 'PRIVATE' : 'PUBLIC';
+			const isPinned = body.pinned ? 1 : 0;
+			const location = String(body.location?.placeholder ?? body.location ?? '').trim();
+			const now = Date.now();
+
+			const row = await env.DB.prepare(
+				'INSERT INTO notes (content, files, is_pinned, created_at, updated_at, pics, visibility, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, content, files, created_at, updated_at, is_pinned, is_archived, pics, visibility, location'
+			)
+				.bind(content, '[]', isPinned, now, now, null, visibility, location)
+				.first();
+
+			return new Response(JSON.stringify(formatMemoRow(row, creator)), {
+				status: 200,
+				headers: getMemosCorsHeaders(),
+			});
+		} catch (e) {
+			return new Response(JSON.stringify({ error: 'Failed to create memo', message: e.message }), {
+				status: 500,
+				headers: getMemosCorsHeaders(),
+			});
+		}
+	}
+
+	return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+		status: 405,
+		headers: getMemosCorsHeaders(),
+	});
+}
+
+/**
+ * 官方 Memos REST API 单条路由：GET/PATCH/PUT/DELETE /api/v1/memos/:id & /api/memos/:id
+ */
+async function handleMemosItem(request, env, memoId) {
+	const creator = `users/${env.USERNAME || 'rushia'}`;
+	const authed = await isMemosApiAuthorized(request, env);
+
+	if (request.method === 'GET') {
+		const row = await env.DB.prepare(
+			'SELECT id, content, files, created_at, updated_at, is_pinned, is_archived, pics, visibility, location FROM notes WHERE id = ?'
+		)
+			.bind(memoId)
+			.first();
+		if (!row || (!authed && (row.is_archived || isRowPrivate(row)))) {
+			return new Response(JSON.stringify({ error: 'Not found' }), {
+				status: 404,
+				headers: getMemosCorsHeaders(),
+			});
+		}
+		return new Response(JSON.stringify(formatMemoRow(row, creator)), {
+			status: 200,
+			headers: getMemosCorsHeaders(),
+		});
+	}
+
+	if (!authed) {
+		return new Response(JSON.stringify({ code: 16, message: 'Unauthorized' }), {
+			status: 401,
+			headers: getMemosCorsHeaders(),
+		});
+	}
+
+	if (request.method === 'PATCH' || request.method === 'PUT') {
+		try {
+			const existing = await env.DB.prepare(
+				'SELECT id, content, files, created_at, updated_at, is_pinned, is_archived, pics, visibility, location FROM notes WHERE id = ?'
+			)
+				.bind(memoId)
+				.first();
+			if (!existing) {
+				return new Response(JSON.stringify({ error: 'Not found' }), {
+					status: 404,
+					headers: getMemosCorsHeaders(),
+				});
+			}
+			const body = await request.json();
+			const content = body.content !== undefined ? String(body.content) : existing.content;
+			const visibility =
+				body.visibility !== undefined
+					? String(body.visibility).toUpperCase() === 'PRIVATE'
+						? 'PRIVATE'
+						: 'PUBLIC'
+					: existing.visibility || 'PUBLIC';
+			const isPinned = body.pinned !== undefined ? (body.pinned ? 1 : 0) : existing.is_pinned;
+			const isArchived =
+				body.state !== undefined
+					? String(body.state).toUpperCase() === 'ARCHIVED'
+						? 1
+						: 0
+					: existing.is_archived;
+			const location =
+				body.location !== undefined
+					? String(body.location?.placeholder ?? body.location ?? '').trim()
+					: existing.location || '';
+			const now = Date.now();
+
+			const updated = await env.DB.prepare(
+				'UPDATE notes SET content = ?, visibility = ?, is_pinned = ?, is_archived = ?, location = ?, updated_at = ? WHERE id = ? RETURNING id, content, files, created_at, updated_at, is_pinned, is_archived, pics, visibility, location'
+			)
+				.bind(content, visibility, isPinned, isArchived, location, now, memoId)
+				.first();
+
+			return new Response(JSON.stringify(formatMemoRow(updated, creator)), {
+				status: 200,
+				headers: getMemosCorsHeaders(),
+			});
+		} catch (e) {
+			return new Response(JSON.stringify({ error: 'Failed to update memo', message: e.message }), {
+				status: 500,
+				headers: getMemosCorsHeaders(),
+			});
+		}
+	}
+
+	if (request.method === 'DELETE') {
+		await env.DB.prepare('DELETE FROM notes WHERE id = ?').bind(memoId).run();
+		return new Response(JSON.stringify({}), { status: 200, headers: getMemosCorsHeaders() });
+	}
+
+	return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+		status: 405,
+		headers: getMemosCorsHeaders(),
+	});
+}
+
+/**
+ * 公开动态 RSS 2.0 订阅源：GET /rss.xml & /explore/rss.xml
+ */
+async function handleRssFeed(request, env) {
+	const escapeXml = (s) =>
+		String(s || '')
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&apos;');
+
+	const { results } = await env.DB.prepare(
+		"SELECT id, content, created_at, updated_at, visibility, location FROM notes WHERE is_archived = 0 AND UPPER(COALESCE(visibility, 'PUBLIC')) = 'PUBLIC' AND content NOT LIKE '%#private%' ORDER BY created_at DESC LIMIT 30"
+	).all();
+
+	const siteUrl = 'https://blog.rushia.eu.org/dynamic';
+	const selfUrl = new URL(request.url).toString();
+	const items = results
+		.filter((r) => !isRowPrivate(r))
+		.map((r) => {
+			const { content, location } = extractLocationAndCleanContent(r.content, r.location);
+			const ts = Number(r.created_at) || Date.now();
+			const pubDate = new Date(ts < 1e12 ? ts * 1000 : ts).toUTCString();
+			const titleLine = content.split(/\r?\n/)[0].slice(0, 60) || `Memo #${r.id}`;
+			const desc = location ? `${content}\n\n📍 ${location}` : content;
+			return `    <item>
+      <title>${escapeXml(titleLine)}</title>
+      <link>${escapeXml(`${siteUrl}#memo-${r.id}`)}</link>
+      <guid isPermaLink="false">memo-${r.id}</guid>
+      <pubDate>${pubDate}</pubDate>
+      <description>${escapeXml(desc)}</description>
+    </item>`;
+		})
+		.join('\n');
+
+	const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Rushia's Blog · 动态 (Memos)</title>
+    <link>${escapeXml(siteUrl)}</link>
+    <atom:link href="${escapeXml(selfUrl)}" rel="self" type="application/rss+xml" />
+    <description>Rushia's Blog 实时动态订阅</description>
+    <language>zh-CN</language>
+${items}
+  </channel>
+</rss>`;
+
+	return new Response(xml, {
+		status: 200,
+		headers: {
+			'Content-Type': 'application/rss+xml; charset=utf-8',
+			'Access-Control-Allow-Origin': '*',
+			'Cache-Control': 'public, max-age=120',
+		},
+	});
 }
